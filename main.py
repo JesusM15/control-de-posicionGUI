@@ -1,4 +1,3 @@
-# realtime_pyqtgraph_serial_ref_curve.py
 import sys
 import serial
 from collections import deque
@@ -8,8 +7,8 @@ from pyqtgraph.Qt import QtWidgets, QtCore
 
 # --- CONFIG ---
 PORT = 'COM5'
-BAUD = 9600          # pon igual en Arduino: Serial.begin(9600);
-WINDOW_SECONDS = 5.0   # ventana deslizante en segundos
+BAUD = 9600
+WINDOW_SECONDS = 5.0
 MAX_POINTS = 3000
 DOWNSAMPLE_TARGET = 1200
 
@@ -17,7 +16,10 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Control de posición — pyqtgraph (Referencia vs Ángulo)")
-        self.resize(900, 520)
+        self.resize(900, 580)
+
+        # Variable para mostrar error del ángulo
+        self.current_error = 0.0
 
         # --- Serial ---
         try:
@@ -26,9 +28,10 @@ class MainWindow(QtWidgets.QWidget):
             self.ser = None
             print(f"[WARN] No se pudo abrir {PORT}: {e}")
 
-        # --- UI superior: referencia ---
-        top = QtWidgets.QVBoxLayout()   # ahora vertical (ref arriba, PID abajo)
+        # --- UI superior ---
+        top = QtWidgets.QVBoxLayout()
 
+        # === REFERENCIA ===
         refRow = QtWidgets.QHBoxLayout()
         lbl = QtWidgets.QLabel("Referencia (°):")
         self.refEdit = QtWidgets.QLineEdit("0.0")
@@ -42,10 +45,9 @@ class MainWindow(QtWidgets.QWidget):
         refRow.addWidget(self.sendBtn)
         refRow.addSpacing(15)
         refRow.addWidget(self.status, 1)
-
         top.addLayout(refRow)
 
-        # --- Fila para PID: kp, ki, kd + un solo botón ---
+        # === PID ===
         pidRow = QtWidgets.QHBoxLayout()
         pidRow.addWidget(QtWidgets.QLabel("kp:"))
         self.kpEdit = QtWidgets.QLineEdit("1.97")
@@ -64,37 +66,48 @@ class MainWindow(QtWidgets.QWidget):
 
         self.sendPIDBtn = QtWidgets.QPushButton("Enviar PID")
         pidRow.addWidget(self.sendPIDBtn)
-
         pidRow.addStretch(1)
+
         top.addLayout(pidRow)
 
-        # --- Plot ---
+        # === NUEVO: RECUADRO DEL ERROR ===
+        self.errorBox = QtWidgets.QLabel("Error actual: 0.00°")
+        self.errorBox.setStyleSheet("""
+            background-color: #ffffff;
+            color: #000000;
+            border-radius: 6px;
+            border: 1px solid #555;
+            font-size: 12px;
+            font-weight: bold;
+        """)
+        self.errorBox.setFixedWidth(130)
+        self.errorBox.setFixedHeight(45)
+
+        top.addWidget(self.errorBox)
+
+        # === PLOT ===
         self.plot = pg.PlotWidget(background="#0e1116")
         self.plot.setTitle("Ángulo vs Tiempo", color="#e0e0e0")
-        self.plot.setLabel('left', 'Ángulo / Referencia', units='°', color="#cfd8dc")
-        self.plot.setLabel('bottom', 'Tiempo', units='s', color="#cfd8dc")
+        self.plot.setLabel('left', 'Ángulo / Referencia (°)')
+        self.plot.setLabel('bottom', 'Tiempo (s)')
         self.plot.showGrid(x=True, y=True, alpha=0.2)
 
-        self.ymin, self.ymax = -360.0, 360.0
-        self.plot.setYRange(self.ymin, self.ymax)
+        self.plot.setYRange(-360.0, 360.0)
 
-        # Curvas: real (ángulo) y referencia (escalón)
-        self.curve_angle = self.plot.plot([], [], pen=pg.mkPen('#4da3ff', width=2), name="Ángulo")
-        self.curve_ref   = self.plot.plot([], [], pen=pg.mkPen('#ff5555', width=2, style=QtCore.Qt.DashLine),
-                                          name="Referencia")
+        self.curve_angle = self.plot.plot([], [], pen=pg.mkPen('#4da3ff', width=2))
+        self.curve_ref = self.plot.plot([], [], pen=pg.mkPen('#ff5555', width=2, style=QtCore.Qt.DashLine))
 
-        # --- Layout principal ---
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(self.plot)
 
         # Buffers
         self.t0 = None
-        self.x = deque(maxlen=MAX_POINTS)      # tiempo relativo [s]
-        self.y = deque(maxlen=MAX_POINTS)      # ángulo medido
-        self.y_ref = deque(maxlen=MAX_POINTS)  # referencia en cada instante
+        self.x = deque(maxlen=MAX_POINTS)
+        self.y = deque(maxlen=MAX_POINTS)
+        self.y_ref = deque(maxlen=MAX_POINTS)
         self._rx_buf = bytearray()
-        self.current_ref = 0.0                 # último valor de referencia
+        self.current_ref = 0.0
 
         # Conexiones
         self.sendBtn.clicked.connect(self.onSendRef)
@@ -108,13 +121,13 @@ class MainWindow(QtWidgets.QWidget):
         # Timers
         self.readTimer = QtCore.QTimer(self)
         self.readTimer.timeout.connect(self.readSerialBatch)
-        self.readTimer.start(2)    # lectura muy rápida
+        self.readTimer.start(2)
 
         self.plotTimer = QtCore.QTimer(self)
         self.plotTimer.timeout.connect(self.updatePlot)
-        self.plotTimer.start(8)    # plot ~8 ms
+        self.plotTimer.start(8)
 
-    # ====== LECTURA SERIE ======
+    # ===== SERIAL =====
     def readSerialBatch(self):
         if not self.ser:
             return
@@ -128,7 +141,7 @@ class MainWindow(QtWidgets.QWidget):
                     if nl < 0:
                         break
                     line = self._rx_buf[:nl]
-                    del self._rx_buf[:nl+1]
+                    del self._rx_buf[:nl + 1]
                     self._processLine(line)
         except Exception as e:
             self.status.setText(f"Error lectura: {e}")
@@ -139,20 +152,40 @@ class MainWindow(QtWidgets.QWidget):
             s = line.decode('utf-8', errors='ignore').strip()
             if not s:
                 return
+
             parts = s.split(',')
+
+            # Aceptamos dos formatos:
+            # 1) ang, t
+            # 2) ang, algo, t   (por compatibilidad con tu firmware actual)
             if len(parts) < 2:
                 return
+
             ang = float(parts[0])
-            t   = float(parts[1])
-            t_s = t / 1000.0
+
+            if len(parts) >= 3:
+                # Formato: ang, <lo que sea>, t  (ignoramos la parte[1])
+                t = float(parts[2])
+            else:
+                # Formato: ang, t
+                t = float(parts[1])
+
+            # === Calcular el error en Python ===
+            # error = referencia - ángulo
+            self.current_error = self.current_ref - ang
+
+            t_s = t / 1000.0   # si tu tiempo ya viene en ms
             self._pushSample(t_s, ang)
+
         except ValueError:
+            # línea corrupta o valores no numéricos
             pass
 
     def _pushSample(self, t_abs, ang):
         if self.t0 is None:
             self.t0 = t_abs
         t_rel = t_abs - self.t0
+
         self.x.append(t_rel)
         self.y.append(ang)
         self.y_ref.append(self.current_ref)
@@ -163,32 +196,26 @@ class MainWindow(QtWidgets.QWidget):
             self.y.popleft()
             self.y_ref.popleft()
 
-    # ====== PLOT RÁPIDO ======
+    # ===== PLOT =====
     def updatePlot(self):
         if not self.x:
             return
 
-        tmin, tmax = self.x[0], self.x[-1]
-        if tmax <= tmin:
-            tmax = tmin + 1e-6
+        step = max(1, len(self.x) // DOWNSAMPLE_TARGET)
 
-        n = len(self.x)
-        step = max(1, n // DOWNSAMPLE_TARGET)
-
-        if step > 1:
-            xs = list(self.x)[::step]
-            ys = list(self.y)[::step]
-            yrefs = list(self.y_ref)[::step]
-        else:
-            xs = self.x
-            ys = self.y
-            yrefs = self.y_ref
+        xs = list(self.x)[::step]
+        ys = list(self.y)[::step]
+        yrefs = list(self.y_ref)[::step]
 
         self.curve_angle.setData(xs, ys)
         self.curve_ref.setData(xs, yrefs)
-        self.plot.setXRange(tmin, tmax, padding=0)
 
-    # ====== ENVÍO REFERENCIA ======
+        self.plot.setXRange(self.x[0], self.x[-1], padding=0)
+
+        # === ACTUALIZAR RECUADRO DEL ERROR ===
+        self.errorBox.setText(f"Error actual: {self.current_error:.2f}°")
+
+    # ===== REFERENCIA =====
     def onSendRef(self):
         txt = self.refEdit.text().strip()
         try:
@@ -213,17 +240,14 @@ class MainWindow(QtWidgets.QWidget):
             self.status.setText(f"Error TX ref: {e}")
             self.status.setStyleSheet("color: #ff6b6b;")
 
-    # ====== ENVÍO PID ======
+    # ===== PID =====
     def onSendPID(self):
         kp_txt = self.kpEdit.text().strip()
         ki_txt = self.kiEdit.text().strip()
         kd_txt = self.kdEdit.text().strip()
 
-        # Validar que sean números (floats)
         try:
-            float(kp_txt)
-            float(ki_txt)
-            float(kd_txt)
+            float(kp_txt); float(ki_txt); float(kd_txt)
         except ValueError:
             self.status.setText("kp/ki/kd inválidos")
             self.status.setStyleSheet("color: #ff6b6b;")
@@ -234,7 +258,6 @@ class MainWindow(QtWidgets.QWidget):
             self.status.setStyleSheet("color: #ff6b6b;")
             return
 
-        # Formato requerido: kd=n,ki=m,kp=a\n
         cmd = f"kd={kd_txt},ki={ki_txt},kp={kp_txt}\n"
         try:
             self.ser.write(cmd.encode('utf-8'))
@@ -244,7 +267,7 @@ class MainWindow(QtWidgets.QWidget):
             self.status.setText(f"Error TX PID: {e}")
             self.status.setStyleSheet("color: #ff6b6b;")
 
-    # ====== CIERRE ======
+    # ===== CIERRE =====
     def closeEvent(self, event):
         try:
             if self.ser and self.ser.is_open:
@@ -252,6 +275,7 @@ class MainWindow(QtWidgets.QWidget):
         except:
             pass
         event.accept()
+
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
